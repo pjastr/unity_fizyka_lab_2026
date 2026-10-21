@@ -1,0 +1,616 @@
+---
+title: "Ćw #3 - proca i wieża: mini-Angry Birds na fizyce 3D"
+lang: pl
+format: gfm
+---
+
+::: {.callout-note}
+**Cel:** zbudować prototyp gry w stylu Angry Birds 3D. Wyrzutnia strzela kulą w wieżę z klocków z różnych materiałów, klocki i cele pękają od mocnych uderzeń, a sędzia ogłasza wynik dopiero wtedy, gdy scena się uspokoi. Przy okazji sprawdzisz **eksperymentalnie** zagadnienia z wykładu 3: masę i impuls (Δv = J / m), Physics Material, `OnCollisionEnter` i `Collision.impulse`, rzut ukośny, uśpienie ciał, tunelowanie i interpolację.
+
+**Wymagane:** narzędzia z lab03 (`[SerializeField]`, `[Range]`, `[ContextMenu]`, właściwości, korutyny, dziedziczenie) i nowy Input System.
+
+**Materiały:** wykład 3, część „Fizyka w Unity”, oraz projekt `unity_fizyka_2026` (sceny 01, 05, 08, 09, 11, 12, 14).
+
+**Czas:** 90 min.
+:::
+
+---
+
+## Po co to?
+
+Na wykładzie rozłożyliśmy Angry Birds na części: **jeden czasownik** (strzał) plus **symulacja fizyki** daje grę, w której każdy strzał kończy się trochę inaczej. Teraz zbudujesz to samo w 3D i zobaczysz tetradę warstwową w praktyce. W **warstwie wbudowanej** ustawiasz tylko liczby: masę, tarcie, sprężystość i wytrzymałość klocków. W **warstwie dynamicznej** silnik fizyki robi z nich zawalającą się wieżę, której nikt nie zaprogramował „krok po kroku”.
+
+Wszystko sprawdzisz przyciskami testowymi z menu Inspektora (jak w Ćw #12 z lab03), bez ręcznego celowania za każdym razem.
+
+## Plan
+
+| # | Krok | Czas |
+|---|------|-----:|
+| 1 | [Scena i materiały fizyczne](#1-scena-i-materiały-fizyczne) | 8 min |
+| 2 | [Klocki i cele (dziedziczenie)](#2-klocki-i-cele-dziedziczenie) | 15 min |
+| 3 | [Wieża z kodu: `TowerBuilder`](#3-wieża-z-kodu-towerbuilder) | 12 min |
+| 4 | [Wyrzutnia i trajektoria](#4-wyrzutnia-i-trajektoria) | 18 min |
+| 5 | [Sędzia poziomu: uśpienie ciał](#5-sędzia-poziomu-uśpienie-ciał) | 10 min |
+| 6 | [Eksperymenty: tunelowanie i interpolacja](#6-eksperymenty-tunelowanie-i-interpolacja) | 12 min |
+| 7 | [Protokół testów](#7-protokół-testów) | 15 min |
+
+::: {.callout-important}
+**Unity 6 - nowe nazwy w API** (wykład 3): `rb.linearVelocity` (dawniej `velocity`), `rb.linearDamping` (dawniej `drag`), `rb.angularDamping`, `PhysicsMaterial` (dawniej `PhysicMaterial`). Stare nazwy dają ostrzeżenia lub błędy kompilacji.
+:::
+
+---
+
+## 1. Scena i materiały fizyczne
+
+1. W projekcie z poprzednich laboratoriów utwórz folder `Assets/Lab04` z podfolderami `Scripts`, `Prefabs`, `Materials`, `Physics`.
+2. Utwórz nową scenę `Lab04_Proca`.
+3. Dodaj podłogę: **Cube** o nazwie `Ground`, pozycja `(0, -0.5, 6)`, skala `(30, 1, 40)`. To obiekt **statyczny** (sam collider, bez `Rigidbody`).
+4. W `Physics` utwórz pięć materiałów fizycznych (**PPM → Create → Physics Material**):
+
+| Plik | Dynamic Friction | Static Friction | Bounciness | Friction Combine | Bounce Combine |
+|------|-----:|-----:|-----:|------|------|
+| `PM_Ground` | 0,6 | 0,6 | 0 | Average | Average |
+| `PM_Drewno` | 0,5 | 0,6 | 0,1 | Average | Average |
+| `PM_Kamien` | 0,7 | 0,8 | 0 | Average | Average |
+| `PM_Szklo` | 0,15 | 0,2 | 0,2 | Average | Average |
+| `PM_Guma` | 0,8 | 0,9 | 0,6 | Average | **Maximum** |
+
+5. Przypisz `PM_Ground` do pola *Material* w *Box Collider* podłogi.
+6. W `Materials` utwórz materiały URP (*Lit*) do wyglądu: `M_Drewno` (brązowy), `M_Kamien` (szary), `M_Szklo` (jasnoniebieski, *Surface Type = Transparent*, alfa ok. 0,5), `M_Cel` (zielony), `M_Pocisk` (czerwony).
+
+::: {.callout-tip}
+**Physics Material ≠ Material.** Physics Material (pole *Material* collidera) opisuje, jak powierzchnia **się zachowuje**: tarcie i odbicia. Zwykły Material (w *Mesh Renderer*) opisuje tylko, jak **wygląda**. Pocisk ma *Bounce Combine = Maximum*, więc odbija się sprężyście od każdej powierzchni (priorytet: Average < Minimum < Multiply < Maximum).
+:::
+
+---
+
+## 2. Klocki i cele (dziedziczenie)
+
+Klocki i cele (zielone kulki, „świnie”) zachowują się podobnie: pękają, gdy uderzenie jest za mocne. Wspólną logikę umieścisz w klasie bazowej `Breakable`.
+
+### 2.1. Klasa bazowa `Breakable`
+
+```csharp
+using UnityEngine;
+
+// Wspólna klasa bazowa: wszystko, co może pęknąć od uderzenia.
+[RequireComponent(typeof(Rigidbody))]
+public class Breakable : MonoBehaviour
+{
+    [SerializeField, Tooltip("Impuls [N·s], powyżej którego obiekt pęka")]
+    private float strength = 6f;
+
+    [SerializeField, Tooltip("Czas [s] po pojawieniu się, w którym uderzenia są ignorowane")]
+    private float graceTime = 0.5f;
+
+    protected Rigidbody rb;
+    private float spawnTime;
+    private bool broken;
+
+    public bool IsBroken => broken;
+
+    protected virtual void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+        spawnTime = Time.time;
+    }
+
+    void OnCollisionEnter(Collision c)
+    {
+        // Wieża "osiada" chwilę po zbudowaniu - te kontakty pomijamy
+        if (Time.time - spawnTime < graceTime) return;
+
+        float j = c.impulse.magnitude;   // [N·s]
+        // TODO 2: jeśli j > strength:
+        //         - wypisz Debug.Log: kto pękł, od czego (c.gameObject.name) i jaki był impuls,
+        //         - wywołaj Break()
+    }
+
+    public void Break()
+    {
+        if (broken) return;   // kilka kontaktów w jednym kroku = kilka wywołań!
+        broken = true;
+        OnBreak();
+        Destroy(gameObject);
+    }
+
+    // Miejsce na reakcję klas pochodnych (log, punkty, odłamki...)
+    protected virtual void OnBreak() { }
+
+    [ContextMenu("TEST / Pęknij")]
+    private void TestBreak() => Break();
+}
+```
+
+::: {.callout-tip}
+Po co flaga `broken`? `Destroy` usuwa obiekt dopiero **na końcu klatki**. Jeśli w jednym kroku fizyki klocek dotknie kilku obiektów, `OnCollisionEnter` wykona się kilka razy, a bez flagi klocek „pęknie” kilka razy (podwójne logi, podwójne punkty). To ten sam problem co podwójny `GAME OVER` w lab03.
+:::
+
+### 2.2. Klocek `Block`
+
+Unity **nie liczy masy z rozmiaru collidera**: klocek trzy razy większy nadal waży 1 kg. Moment bezwładności liczy automatycznie (wykład, scena 06), masę musimy ustawić sami.
+
+```csharp
+using UnityEngine;
+
+public class Block : Breakable
+{
+    [SerializeField, Tooltip("Umowna gęstość: masa = gęstość × objętość")]
+    private float density = 2f;
+
+    protected override void Awake()
+    {
+        base.Awake();
+        UpdateMass();
+    }
+
+    // Wywołaj po każdej zmianie skali klocka!
+    public void UpdateMass()
+    {
+        Vector3 s = transform.lossyScale;
+        // TODO 1: rb.mass = gęstość × objętość prostopadłościanu
+        //         (Cube ma wymiary 1×1×1, więc objętość = s.x · s.y · s.z)
+    }
+}
+```
+
+### 2.3. Cel `Target`
+
+```csharp
+using UnityEngine;
+
+public class Target : Breakable
+{
+    [SerializeField, Tooltip("Poniżej tej wysokości cel uznajemy za strącony")]
+    private float fallLimit = -3f;
+
+    void FixedUpdate()
+    {
+        if (transform.position.y < fallLimit) Break();
+    }
+
+    protected override void OnBreak()
+    {
+        Debug.Log($"<color=lime>[{name}] CEL TRAFIONY</color>");
+    }
+}
+```
+
+### 2.4. Prefaby
+
+1. Utwórz **Cube** `Blok_Drewno`: dodaj `Rigidbody` i `Block`, w *Box Collider* ustaw `PM_Drewno`, w rendererze `M_Drewno`. Przeciągnij go do `Prefabs` i usuń ze sceny.
+2. Dwa pozostałe klocki zrób jako **warianty**: PPM na `Blok_Drewno` → **Create → Prefab Variant**. W wariantach zmień tylko to, co się różni.
+3. Kulki `Cel` i `Pocisk` to **Sphere** z `Rigidbody`. Pocisk **nie ma** skryptu `Breakable`.
+
+| Prefab | Kształt | Density | Strength | Rigidbody | Physics Material | Materiał |
+|--------|---------|-----:|-----:|-----------|------|------|
+| `Blok_Drewno` | Cube | 2 | 6 | domyślnie | `PM_Drewno` | `M_Drewno` |
+| `Blok_Szklo` (wariant) | Cube | 1,5 | 2 | domyślnie | `PM_Szklo` | `M_Szklo` |
+| `Blok_Kamien` (wariant) | Cube | 6 | 40 | domyślnie | `PM_Kamien` | `M_Kamien` |
+| `Cel` | Sphere, skala 0,7 | - | 3 | *Mass* 1, *Angular Damping* 0,5 | `PM_Drewno` | `M_Cel` |
+| `Pocisk` | Sphere, skala 0,6 | - | - | *Mass* 3, *Angular Damping* 0,5, *Collision Detection* **Discrete**, *Interpolate* **None** | `PM_Guma` | `M_Pocisk` |
+
+4. Uzupełnij **TODO 1-2**.
+
+::: {.callout-note}
+Gęstości są umowne, dobrane tak, żeby masy klocków wyszły rzędu 1-5 kg, a pocisk ważył 3 kg. Wykład: stosunek mas zderzających się ciał powinien być mniejszy niż ok. 1:100, inaczej solver fizyki traci stabilność.
+:::
+
+---
+
+## 3. Wieża z kodu: `TowerBuilder`
+
+Ręczne układanie klocków jest żmudne i każda wieża wychodzi trochę inna. Zbudujemy ją skryptem. Jedno piętro to dwa filary, belka (strop) i cel pomiędzy filarami:
+
+```
+  ███████████████   ← belka (strop piętra)
+  ██     ●     ██   ← cel stoi na podłodze piętra
+  ██           ██
+  ██           ██   ← filary
+──────────────────  ← podłoga lub strop niższego piętra
+```
+
+1. Utwórz pusty obiekt `Wieza` w pozycji `(0, 0, 12)`, skala `(1, 1, 1)`, i dodaj do niego skrypt:
+
+```csharp
+using UnityEngine;
+
+public class TowerBuilder : MonoBehaviour
+{
+    [SerializeField, Tooltip("Materiał kolejnych pięter (cyklicznie)")]
+    private Block[] floorPrefabs;
+    [SerializeField] private Target targetPrefab;
+
+    [SerializeField, Range(1, 8)] private int floors = 3;
+    [SerializeField, Range(1f, 4f)] private float span = 2f;   // rozstaw osi filarów [m]
+    [SerializeField] private Vector3 pillarSize = new Vector3(0.3f, 1.5f, 1f);
+    [SerializeField, Range(0.1f, 0.6f)] private float beamHeight = 0.3f;
+
+    void Start() => Build();
+
+    [ContextMenu("Przebuduj wieżę")]
+    public void Build()
+    {
+        Clear();
+        float y = 0f;   // wysokość podłogi bieżącego piętra (lokalnie)
+
+        for (int i = 0; i < floors; i++)
+        {
+            Block prefab = floorPrefabs[i % floorPrefabs.Length];
+
+            // filary
+            float py = y + pillarSize.y / 2f;
+            SpawnBlock(prefab, new Vector3(-span / 2f, py, 0f), pillarSize, $"P{i}_Filar_L");
+            SpawnBlock(prefab, new Vector3( span / 2f, py, 0f), pillarSize, $"P{i}_Filar_P");
+
+            // TODO 3: postaw cel (targetPrefab) na środku piętra, tak aby LEŻAŁ na podłodze piętra.
+            //         Nazwij go $"P{i}_Cel". Promień kulki = połowa jej skali.
+
+            // belka (strop) na filarach
+            y += pillarSize.y;
+            Vector3 beamSize = new Vector3(span + pillarSize.x, beamHeight, pillarSize.z);
+            SpawnBlock(prefab, new Vector3(0f, y + beamHeight / 2f, 0f), beamSize, $"P{i}_Belka");
+            y += beamHeight;
+        }
+    }
+
+    private void SpawnBlock(Block prefab, Vector3 localPos, Vector3 size, string blockName)
+    {
+        Block b = Instantiate(prefab, transform);
+        b.name = blockName;
+        b.transform.localPosition = localPos;
+        b.transform.localRotation = Quaternion.identity;
+        b.transform.localScale = size;
+        b.UpdateMass();   // Awake() policzył masę jeszcze dla skali 1×1×1!
+    }
+
+    private void Clear()
+    {
+        for (int i = transform.childCount - 1; i >= 0; i--)
+        {
+            GameObject child = transform.GetChild(i).gameObject;
+            child.SetActive(false);   // Destroy działa dopiero na końcu klatki
+            Destroy(child);
+        }
+    }
+}
+```
+
+2. W Inspektorze ustaw: *Floor Prefabs* = `Blok_Drewno`, `Blok_Szklo`, `Blok_Kamien` (ciężki kamienny strop na kruchym szkle), *Target Prefab* = `Cel`, *Floors* = 3.
+3. Uzupełnij **TODO 3**, uruchom **Play** i sprawdź, czy wieża stoi. Kliknij kilka razy **⋮ → Przebuduj wieżę**.
+
+::: {.callout-warning}
+Nie przesuwaj ani nie skaluj obiektu `Wieza` w trakcie gry. To zwykły obiekt bez `Rigidbody`, a klocki to jego dzieci: przesunięcie rodzica „teleportuje” wszystkie klocki z pominięciem fizyki (wykład, scena 15, tor D). Skala rodzica musi wynosić 1, bo `lossyScale` klocków wchodzi do wzoru na masę.
+:::
+
+---
+
+## 4. Wyrzutnia i trajektoria
+
+### 4.1. Obiekty
+
+| Obiekt | Typ | Pozycja | Rotacja | Skala | Uwagi |
+|--------|-----|---------|---------|-------|-------|
+| `Wyrzutnia` | Empty | (0, 1, 0) | (0, 0, 0) | 1 | skrypt `Launcher` + `Line Renderer` |
+| └ `Lufa` | Cylinder | (0, 0, 0.6) | (90, 0, 0) | (0.3, 0.6, 0.3) | **usuń Capsule Collider** |
+| └ `Wylot` | Empty | (0, 0, 1.3) | (0, 0, 0) | 1 | punkt pojawienia się pocisku |
+| `Main Camera` | - | (4, 4, -5) | (10, -13, 0) | - | widok na wyrzutnię i wieżę |
+
+W *Line Renderer* ustaw *Width* = 0,05. Jeśli linia jest różowa, przypisz jej materiał URP *Unlit* (np. nowy `M_Linia`).
+
+::: {.callout-important}
+Collider lufy trzeba usunąć. Inaczej pocisk pojawia się częściowo w jej wnętrzu i silnik „wypycha” go w losowym kierunku, a strzał leci krzywo.
+:::
+
+### 4.2. Skrypt `Launcher`
+
+```csharp
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[RequireComponent(typeof(LineRenderer))]
+public class Launcher : MonoBehaviour
+{
+    [SerializeField] private Rigidbody projectilePrefab;
+    [SerializeField, Tooltip("Punkt wylotu - dziecko wyrzutni")]
+    private Transform muzzle;
+
+    [Header("Celowanie")]
+    [SerializeField, Range(0f, 80f)] private float pitch = 20f;      // kąt w pionie [°]
+    [SerializeField, Range(-45f, 45f)] private float yaw = 0f;       // kąt w poziomie [°]
+    [SerializeField, Range(1f, 300f)] private float impulse = 40f;   // [N·s]
+    [SerializeField] private float aimSpeed = 30f;                   // [°/s]
+    [SerializeField] private float powerSpeed = 20f;                 // [N·s na sekundę]
+
+    [Header("Strzały")]
+    [SerializeField, Range(1, 20)] private int maxShots = 3;
+    [SerializeField] private float projectileLifetime = 15f;
+
+    [Header("Trajektoria")]
+    [SerializeField, Range(10, 100)] private int trajectoryPoints = 40;
+    [SerializeField] private float trajectoryStep = 0.05f;           // [s] między punktami
+
+    private LineRenderer line;
+
+    public int ShotsLeft { get; private set; }
+    public Rigidbody LastProjectile { get; private set; }
+
+    void Awake() => line = GetComponent<LineRenderer>();
+
+    void Start() => ResetShots();
+
+    void Update()
+    {
+        Keyboard kb = Keyboard.current;
+        if (kb == null) return;
+
+        // TODO 4: strzałki ←/→ zmieniają yaw, ↑/↓ zmieniają pitch (aimSpeed · Time.deltaTime),
+        //         klawisze W/S zmieniają impulse (powerSpeed · Time.deltaTime).
+        //         Ogranicz wartości do zakresów z [Range] (Mathf.Clamp).
+        //         Podpowiedź: kb.leftArrowKey.isPressed
+
+        transform.rotation = Quaternion.Euler(-pitch, yaw, 0f);   // minus: dodatni kąt wokół X pochyla w dół
+        DrawTrajectory();
+
+        if (kb.spaceKey.wasPressedThisFrame) Fire();
+    }
+
+    [ContextMenu("TEST / Strzał")]
+    public void Fire()
+    {
+        if (ShotsLeft <= 0) { Debug.Log("Brak strzałów"); return; }
+        ShotsLeft--;
+
+        Rigidbody p = Instantiate(projectilePrefab, muzzle.position, muzzle.rotation);
+        // TODO 5: nadaj pociskowi impuls o wartości impulse wzdłuż muzzle.forward
+        Destroy(p.gameObject, projectileLifetime);
+        LastProjectile = p;
+
+        Debug.Log($"Strzał: J = {impulse:0} N·s, v0 = {impulse / p.mass:0.0} m/s, zostało {ShotsLeft}");
+    }
+
+    public void ResetShots() => ShotsLeft = maxShots;
+
+    private void DrawTrajectory()
+    {
+        Vector3 p0 = muzzle.position;
+        Vector3 v0 = muzzle.forward * (impulse / projectilePrefab.mass);   // Δv = J / m
+        Vector3 g = Physics.gravity;
+
+        line.positionCount = trajectoryPoints;
+        for (int i = 0; i < trajectoryPoints; i++)
+        {
+            float t = i * trajectoryStep;
+            // TODO 6: położenie w rzucie ukośnym: p(t) = p0 + v0·t + ½·g·t²
+            Vector3 p = p0;
+            line.SetPosition(i, p);
+        }
+    }
+}
+```
+
+1. Podłącz w Inspektorze *Projectile Prefab* = `Pocisk` i *Muzzle* = `Wylot`.
+2. Uzupełnij **TODO 4-6**.
+
+| Klawisz | Działanie |
+|---------|-----------|
+| ← / → | obrót w poziomie (*yaw*) |
+| ↑ / ↓ | kąt podniesienia (*pitch*) |
+| W / S | siła strzału (impuls) |
+| Spacja | strzał |
+
+::: {.callout-tip}
+Dlaczego `v0 = J / m`? Strzał to **impuls** (`ForceMode.Impulse`), więc prędkość wylotowa zależy od masy pocisku (wykład, scena 05). Dla J = 40 N·s i m = 3 kg: v0 ≈ 13,3 m/s. Trajektoria to czysty wzór z fizyki: **nie uwzględnia oporu** (*Linear Damping*) ani zderzeń. Test T4 pokaże, co się stanie, gdy założenia wzoru przestaną się zgadzać z ustawieniami ciała.
+:::
+
+---
+
+## 5. Sędzia poziomu: uśpienie ciał
+
+Wyniku nie można ogłosić zaraz po strzale, bo wieża jeszcze się sypie i cele mogą zginąć sekundę później. Sędzia czeka, aż **wszystkie ciała zasną** (`IsSleeping()`, wykład, scena 14), albo aż minie limit czasu.
+
+Utwórz pusty obiekt `Sedzia` ze skryptem:
+
+```csharp
+using System.Collections;
+using UnityEngine;
+
+public class LevelJudge : MonoBehaviour
+{
+    [SerializeField] private Launcher launcher;
+    [SerializeField] private TowerBuilder tower;
+    [SerializeField, Tooltip("Maks. czas czekania na uspokojenie sceny [s]")]
+    private float maxWait = 10f;
+
+    private bool judging;
+
+    // GetComponentsInChildren pomija obiekty nieaktywne (patrz TowerBuilder.Clear)
+    public int TargetsLeft => tower.GetComponentsInChildren<Target>().Length;
+
+    void Update()
+    {
+        if (judging) return;
+        if (TargetsLeft == 0 || launcher.ShotsLeft == 0)
+            StartCoroutine(Judge());
+    }
+
+    private IEnumerator Judge()
+    {
+        judging = true;
+        Debug.Log("Czekam, aż scena się uspokoi...");
+
+        float t = 0f;
+        // TODO 7: czekaj klatka po klatce (yield return null), dopóki scena nie śpi
+        //         i nie minęło maxWait sekund
+        yield return null;
+
+        int left = TargetsLeft;
+        if (left == 0)
+            Debug.Log($"<color=yellow>WYGRANA! Gwiazdki: {1 + launcher.ShotsLeft}</color>");
+        else
+            Debug.Log($"<color=red>PRZEGRANA - zostało celów: {left}</color>");
+    }
+
+    private bool SceneAsleep()
+    {
+        foreach (Rigidbody rb in tower.GetComponentsInChildren<Rigidbody>())
+            if (!rb.IsSleeping()) return false;
+
+        // TODO 8: sprawdź też ostatni pocisk - uwaga, launcher.LastProjectile może być null
+        //         (jeszcze nie strzelano albo pocisk został już zniszczony)
+        return true;
+    }
+
+    [ContextMenu("TEST / Czy scena śpi?")]
+    private void TestAsleep() => Debug.Log($"Scena śpi: {SceneAsleep()}, celów: {TargetsLeft}");
+
+    [ContextMenu("TEST / Nowa runda")]
+    private void NewRound()
+    {
+        StopAllCoroutines();
+        judging = false;
+        tower.Build();
+        launcher.ResetShots();
+    }
+}
+```
+
+Podłącz *Launcher* i *Tower*, uzupełnij **TODO 7-8**.
+
+---
+
+## 6. Eksperymenty: tunelowanie i interpolacja
+
+Przed każdym eksperymentem **zapisz przewidywanie**, dopiero potem uruchom Play. Na czas eksperymentów ustaw w wyrzutni *Max Shots* = 20.
+
+### 6.1. Tunelowanie (wykład, scena 11)
+
+1. Dodaj **Cube** `Szyba`: pozycja `(0, 1.5, 6)`, skala `(4, 3, 0.05)`, materiał `M_Szklo`, **bez** `Rigidbody` (obiekt statyczny).
+2. Ustaw wyrzutnię płasko (*pitch* ok. 2°) i impuls **300 N·s**, czyli v0 = 100 m/s.
+3. Dla każdej konfiguracji oddaj 5 strzałów (po zmianie prefabu zrób **Nowa runda**) i policz, ile pocisków przeleciało przez szybę.
+
+| Konfiguracja | Przewidywanie | Przeleciało (z 5) |
+|--------------|---------------|:-----------------:|
+| szyba statyczna, pocisk *Discrete* | | |
+| szyba statyczna, pocisk *Continuous* | | |
+| szyba z `Rigidbody` (*Is Kinematic*), pocisk *Continuous* | | |
+| szyba z `Rigidbody` (*Is Kinematic*), pocisk *Continuous Speculative* | | |
+
+**Pytanie:** ile metrów pokonuje pocisk w jednym kroku fizyki (Δt = 0,02 s)? Porównaj to z grubością szyby i średnicą pocisku. Dlaczego w trybie *Discrete* część strzałów jednak trafia?
+
+Po eksperymencie **wyłącz** obiekt `Szyba` i przywróć pociskowi tryb, który uznasz za właściwy (uzasadnij w sprawozdaniu).
+
+### 6.2. Interpolacja (wykład, scena 12)
+
+Dodaj do `Main Camera` kamerę śledzącą pocisk:
+
+```csharp
+using UnityEngine;
+
+public class ChaseCamera : MonoBehaviour
+{
+    [SerializeField] private Launcher launcher;
+    [SerializeField] private Vector3 offset = new Vector3(0f, 1f, -4f);
+    [SerializeField] private float minSpeed = 0.5f;   // wolniej = wracamy do widoku ogólnego
+
+    private Vector3 homePos;
+    private Quaternion homeRot;
+
+    void Start()
+    {
+        homePos = transform.position;
+        homeRot = transform.rotation;
+    }
+
+    void LateUpdate()
+    {
+        Rigidbody p = launcher.LastProjectile;
+        if (p == null || p.linearVelocity.magnitude < minSpeed)
+        {
+            transform.SetPositionAndRotation(homePos, homeRot);
+            return;
+        }
+
+        // transform.position, a NIE p.position - tylko Transform jest interpolowany
+        Vector3 target = p.transform.position;
+        transform.position = target + offset;
+        transform.LookAt(target);
+    }
+}
+```
+
+1. **Edit → Project Settings → Time → Fixed Timestep** = 0,1 (tylko 10 kroków fizyki na sekundę).
+2. Strzelaj normalnym strzałem (20°, 40 N·s) i obserwuj **tło** (wieżę, podłogę), a nie sam pocisk.
+
+| Fixed Timestep | *Interpolate* pocisku | Obserwacja (płynność, opóźnienie) |
+|---------------:|-----------------------|-----------------------------------|
+| 0,02 | None | |
+| 0,1 | None | |
+| 0,1 | Interpolate | |
+| 0,1 | Extrapolate | |
+
+::: {.callout-warning}
+Po eksperymencie **przywróć Fixed Timestep = 0,02**. To ustawienie całego projektu, nie sceny. Jeśli o tym zapomnisz, fizyka będzie szarpać we wszystkich następnych ćwiczeniach.
+:::
+
+---
+
+## 7. Protokół testów
+
+Przejdź scenariusze w trybie **Play** i uzupełnij tabelę. Przyciski testowe znajdziesz pod **⋮** w nagłówku komponentu (lub PPM na nagłówku). Przed każdym testem kliknij **Sedzia → TEST / Nowa runda**, chyba że scenariusz mówi inaczej.
+
+| # | Kroki | Oczekiwany wynik | Wynik |
+|---|-------|------------------|:-----:|
+| T1 | Start gry, odczekaj 3 s, `TEST / Czy scena śpi?` | wieża stoi, w konsoli brak pęknięć, `Scena śpi: True, celów: 3` | |
+| T2 | Zaznacz klocki w Hierarchii i odczytaj *Mass* | `P0_Filar_L` 0,9 kg; `P1_Filar_L` 0,675 kg; `P2_Belka` 4,14 kg | |
+| T3 | Kąt 20°, impuls 40, `TEST / Strzał` | w konsoli v0 = 13,3 m/s, pocisk leci dokładnie po linii aż do pierwszego zderzenia | |
+| T4 | W prefabie `Pocisk` ustaw *Linear Damping* = 0,5 i strzel, potem przywróć 0 | pocisk spada wyraźnie przed końcem linii | |
+| T5 | `TEST / Pęknij` na `P1_Filar_L` | szklane piętro się sypie, kamienny strop spada; zanotuj, co pękło **od uderzeń** i dlaczego | |
+| T6 | Strzał w szklany filar, potem ten sam impuls w kamienny filar | szkło pęka; kamień nie pęka (sprawdź logiem, jaki impuls dostał) | |
+| T7 | Oddaj 3 strzały, potem Spacja jeszcze raz | 4. strzał: `Brak strzałów`; po uspokojeniu sceny **jeden** komunikat WYGRANA/PRZEGRANA | |
+| T8 | `TEST / Pęknij` na wszystkich trzech celach, bez strzelania | `WYGRANA! Gwiazdki: 3` (**najwyżej 3 gwiazdki**) | |
+| T9 | Po ogłoszeniu wyniku: `TEST / Nowa runda` i strzał | nowa wieża, licznik strzałów od nowa, sędzia znów ogłasza wynik | |
+| T10 | Przesuń cel w oknie Scene poza krawędź podłogi | `CEL TRAFIONY` po spadku poniżej y = -3, liczba celów maleje | |
+| T11 | *Floors* = 6, `TEST / Nowa runda`, odczekaj 3 s | 6 pięter, 6 celów, wieża stoi (jak w T1) | |
+| T12 | Po kroku 6 | *Fixed Timestep* = 0,02, `Szyba` wyłączona, *Max Shots* = 3 | |
+
+::: {.callout-tip}
+Konsola: włącz **Collapse**. Od razu zobaczysz, czy komunikat sędziego albo `CEL TRAFIONY` pojawił się raz, czy kilka razy (T7, T8).
+:::
+
+**Jeśli któryś scenariusz nie przechodzi**, popraw skrypt i powtórz **wszystkie** scenariusze. Zwróć uwagę na T8: kod sędziego podany w kroku 5 zawiera błąd, który ten test ma wykryć.
+
+---
+
+## Oddanie
+
+- [ ] Skrypty `Breakable`, `Block`, `Target`, `TowerBuilder`, `Launcher`, `LevelJudge`, `ChaseCamera`.
+- [ ] Uzupełniona tabela T1-T12 (✅/❌) i krótki opis błędów, które wyszły w trakcie testów, oraz sposobu ich poprawienia.
+- [ ] Tabele eksperymentów z kroku 6 (przewidywanie + wynik) i odpowiedź na pytanie o tunelowanie.
+- [ ] 3-4 zdania w języku tetrady warstwowej: które parametry ustawiłeś w **warstwie wbudowanej** i jakie zachowanie zaobserwowałeś w **warstwie dynamicznej**, którego wprost nie zaprogramowałeś.
+
+## Zadania dodatkowe
+
+1. **Odłamki** (estetyka proceduralna): w `Block.OnBreak()` utwórz 4-8 małych sześcianów z `Rigidbody`, nadaj im prędkość pękniętego klocka (`rb.linearVelocity`) plus `AddExplosionForce` i usuń je po 3 s.
+2. **Zdolność ptaka**: Spacja w trakcie lotu daje pociskowi jednorazowe przyspieszenie (`ForceMode.VelocityChange`) albo dzieli go na trzy mniejsze pociski.
+3. **Wytrzymałość zamiast progu**: zamiast pękać od jednego mocnego uderzenia, klocek traci „życie” o nadwyżkę impulsu ponad próg i ciemnieje (`Color.Lerp`, jak w lab03).
+4. **Proca myszą**: naciąganie przeciągnięciem myszy (raycast jak w `PokeTool` z projektu `unity_fizyka_2026`), impuls proporcjonalny do długości naciągu.
+5. Wyświetl liczbę strzałów, celów i gwiazdek na Canvasie.
+
+<details>
+<summary><b>Typowe błędy</b></summary>
+
+- **T2 / TODO 1:** `localScale` zamiast `lossyScale` działa tylko przypadkiem (rodzic ma skalę 1). Częściej: brak `UpdateMass()` po skalowaniu, czyli wszystkie klocki ważą tyle co klocek 1×1×1 (2 / 1,5 / 6 kg). Wartości wzorcowe: filar 0,3×1,5×1 = 0,45 m³, belka 2,3×0,3×1 = 0,69 m³.
+- **T1 / TODO 3:** cel ustawiony na `y + pillarSize.y` (w belce) albo bez dodania promienia (do połowy w podłodze). Silnik wypycha go z kolizji, cel wylatuje albo rozsadza piętro. Poprawnie: `y + targetPrefab.transform.localScale.y / 2f`, obliczone **przed** `y += pillarSize.y`.
+- **T1:** wieża pęka sama na starcie, gdy ktoś usunie `graceTime` albo poda za mały próg `strength` dla szkła. Dobra okazja do rozmowy o tym, że `OnCollisionEnter` przychodzi też przy „osiadaniu”.
+- **T3 / TODO 5-6:** `v0 = muzzle.forward * impulse` (bez dzielenia przez masę) daje linię trzy razy za długą; brak `0.5f` przy `g·t²` daje tor za stromy. `ForceMode.Force` zamiast `Impulse` daje „pyknięcie” zamiast strzału (siła działa tylko przez jeden krok).
+- **T4:** trajektoria nie zna oporu. Dobra okazja, żeby powiedzieć, że *Linear Damping* w Unity to uproszczenie, a nie prawdziwy opór powietrza.
+- **T5-T6:** ten sam impuls działa na oba ciała w zderzeniu, więc spadający kamienny strop rozbija szkło, a sam się nie rozbija. Typowy przykład emergencji z wykładu.
+- **T7 / TODO 7-8:** brak sprawdzenia `LastProjectile != null` daje `MissingReferenceException` po zniszczeniu pocisku; `yield return null` poza pętlą, czyli sędzia ogłasza wynik po jednej klatce.
+- **T8:** celowy błąd: `1 + launcher.ShotsLeft` daje 4 gwiazdki, gdy wygrano bez strzału. Poprawnie np. `Mathf.Min(3, 1 + launcher.ShotsLeft)` lub `Mathf.Clamp`.
+- **Krok 4:** kolider lufy nieusunięty, czyli krzywe strzały. Znak w `Quaternion.Euler(-pitch, ...)` odwrócony, czyli wyrzutnia celuje w ziemię.
+- **6.1:** przy 100 m/s pocisk pokonuje 2 m na krok, a szyba z pociskiem to ok. 0,65 m, więc w trybie *Discrete* trafia tylko część strzałów (zależnie od „fazy” kroku). Według dokumentacji *Continuous* działa względem colliderów **statycznych**, więc z kinematyczną szybą może znów przelatywać. *Continuous Speculative* obsługuje też ciała kinematyczne, ale może dawać fałszywe („duchowe”) kontakty. Wyniki zależą od wersji PhysX, dlatego liczy się porównanie przewidywania z obserwacją, a nie „jedyna słuszna” tabela.
+- **6.2:** jeśli ktoś w `ChaseCamera` użyje `p.position` (pozycja z kroku fizyki), interpolacja nic nie zmieni, bo interpolowany jest tylko `Transform`. Warto to pokazać jako pytanie kontrolne.
+- **T12:** niezresetowany *Fixed Timestep* to najczęstsza przyczyna „dziwnej fizyki” na kolejnych zajęciach.
+
+</details>
